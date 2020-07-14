@@ -16,7 +16,7 @@
 #   -T/--script: Linker scripts are not supported.
 #   --start-group/--end-group: Symbols are always globally resolved, like in lld.
 
-from typing import FrozenSet, Union, NamedTuple, DefaultDict, List, Dict, Set, Tuple, Callable
+from typing import FrozenSet, Union, NamedTuple, DefaultDict, List, Dict, Set, AbstractSet, Tuple, Callable
 from collections import defaultdict
 import argparse
 import subprocess
@@ -347,22 +347,29 @@ LinkReferencePath = Tuple[LinkReference,...]
 if args.require_defined:
     require_defined: Set[SymbolName] = set(args.require_defined)
 
-def is_valid_link_ref_path(path: LinkReferencePath) -> bool:
-    if len(path) == 0:
-        return False
-    if args.require_defined:
-        path_syms: Set[SymbolName] = set()
-        for link_ref in path:
+def prune_link_ref_path(path: LinkReferencePath) -> LinkReferencePath:
+    if len(path) == 0 or args.whole_archive:
+        return path
+    elif args.require_defined:
+        found_required_at = -1
+        for i, link_ref in enumerate(path[::-1]):
+            path_syms: AbstractSet[SymbolName]
             if isinstance(link_ref.group, Section):
                 section = link_ref.group
-                path_syms |= global_defs_grouped[section.obj][section].keys()
+                path_syms = global_defs_grouped[section.obj][section].keys()
             else: # Object
                 obj = link_ref.group
+                path_syms = set()
                 for section_syms in global_defs_grouped[obj].values():
                     path_syms |= section_syms.keys()
-        if require_defined.isdisjoint(path_syms):
-            return False
-    return True
+            if not require_defined.isdisjoint(path_syms):
+                found_required_at = len(path) - 1 - i
+                break
+        if found_required_at == -1:
+            return tuple()
+        else:
+            return tuple(path[:found_required_at + 1])
+    assert False
 
 def walk_link_ref_paths(sym_name: str, path_fn: Callable[[LinkReferencePath], None],
                         head_path: LinkReferencePath=()) -> None:
@@ -370,8 +377,9 @@ def walk_link_ref_paths(sym_name: str, path_fn: Callable[[LinkReferencePath], No
         print(f'{sym_name}')
     sym_refs = refs[sym_name]
     if not sym_refs:
-        if is_valid_link_ref_path(head_path):
-            path_fn(head_path)
+        pruned_path = prune_link_ref_path(head_path)
+        if pruned_path:
+            path_fn(pruned_path)
         return
     if args.gc_sections:
         def by_section_key(sym_ref: SymbolReference):
@@ -408,11 +416,24 @@ def walk_link_ref_paths(sym_name: str, path_fn: Callable[[LinkReferencePath], No
 def print_link_ref_path(path: LinkReferencePath):
     for i, link_ref in enumerate(path):
         if isinstance(link_ref.group, Object):
-            print(f' #{i+1} {link_ref.group.name} ({fmt_path(link_ref.group.archive)})')
+            print(f'#{i+1} {link_ref.group.name} ({fmt_path(link_ref.group.archive)})')
+            path_syms = set()
+            for section_syms in global_defs_grouped[link_ref.group].values():
+                path_syms |= section_syms.keys()
         else: # Section
-            print(f' #{i+1} {link_ref.group.name} ({link_ref.group.obj.name} {fmt_path(link_ref.group.obj.archive)})')
-        for sym_ref in link_ref.refs:
-            print(f'    {sym_ref.referencing_sym.name} {fmt_path(sym_ref.src)}')
+            print(f'#{i+1} {link_ref.group.name} ({link_ref.group.obj.name} {fmt_path(link_ref.group.obj.archive)})')
+            path_syms = global_defs_grouped[link_ref.group.obj][link_ref.group].keys()
+        global_ref_sym_names = set()
+        for sym_ref in sorted(link_ref.refs, key=lambda sym_ref: sym_ref.referencing_sym.name + sym_ref.src):
+            sym = sym_ref.referencing_sym
+            if sym.is_global and sym.name in require_defined:
+                prefix = '*'
+                global_ref_sym_names.add(sym.name)
+            else:
+                prefix = ' '            
+            print(f'  {prefix}{sym.name} {fmt_path(sym_ref.src)}')
+        for require_defined_sym in sorted(require_defined & path_syms - global_ref_sym_names):
+            print(f'  *{require_defined_sym}')
 
 print()
 for sym_name in args.trace_symbol:
@@ -424,9 +445,10 @@ for sym_name in args.trace_symbol:
         if path_groups in seen:
             return
         seen.add(path_groups)
-        print(f' #0 {sym_name}')
+        print(f'#0 {sym_name}')
         print_link_ref_path(path)
         print()
     walk_link_ref_paths(sym_name, on_path_found)
     if not seen:
         print(f'No paths found for {sym_name}.')
+        print()
