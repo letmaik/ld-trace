@@ -308,14 +308,14 @@ for archive in args.files:
             else:              
                 if sym_name not in sym_not_found_warnings_printed:
                     sym_not_found_warnings_printed.add(sym_name)
-                    print(f'WARNING: referencing symbol {sym_name} ({section.name}) not found in definitions, ignoring')
+                    # This may happen with static inline definitions.
+                    print(f'Note: referencing symbol {sym_name} ({section.name}) not found in definitions, ignoring')
                     if args.trace:
                         print(f'{obj.name} ({obj.archive})')
                         for section, syms in defs_grouped[obj].items():
                             print(f' {section.name}')
                             for sym_ in syms.values():
                                 print(f'   {sym_.name}')
-                    exit_if_fatal_warnings()
                 continue
             assert sym
             refs[ref_sym].append(SymbolReference(
@@ -426,14 +426,15 @@ def print_link_ref_path(path: LinkReferencePath):
         global_ref_sym_names = set()
         for sym_ref in sorted(link_ref.refs, key=lambda sym_ref: sym_ref.referencing_sym.name + sym_ref.src):
             sym = sym_ref.referencing_sym
-            if sym.is_global and sym.name in require_defined:
+            if sym.is_global and args.require_defined and sym.name in require_defined:
                 prefix = '*'
                 global_ref_sym_names.add(sym.name)
             else:
                 prefix = ' '            
             print(f'  {prefix}{sym.name} {fmt_path(sym_ref.src)}')
-        for require_defined_sym in sorted(require_defined & path_syms - global_ref_sym_names):
-            print(f'  *{require_defined_sym}')
+        if args.require_defined:
+            for require_defined_sym in sorted(require_defined & path_syms - global_ref_sym_names):
+                print(f'  *{require_defined_sym}')
 
 print()
 for sym_name in args.trace_symbol:
