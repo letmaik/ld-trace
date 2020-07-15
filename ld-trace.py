@@ -73,6 +73,8 @@ parser.add_argument('-t', '--trace', action='store_true', help='more diagnostic 
 
 # custom flags
 parser.add_argument('--strip-prefix', help='remove given path prefix in output')
+parser.add_argument('--direct-only', action='store_true', help='filter out traces with indirect references')
+parser.add_argument('--first-only', action='store_true', help='show only the first trace for each traced symbol')
 parser.add_argument('--cache-dir', default=os.path.expanduser('~/.cache/ld-trace'), help='cache directory')
 parser.add_argument('--refresh-cache', action='store_true')
 parser.add_argument('--no-cache', action='store_true')
@@ -114,7 +116,8 @@ if not args.no_cache:
 def run(args_: List[str], depends: List[str]) -> str:
     assert len(depends) > 0
     cmd = ' '.join(args_)
-    print(f'> {cmd}', end='', flush=True)
+    if args.verbose:
+        print(f'> {cmd}', end='', flush=True)
     out = None
     cache_path = None
     mtime = None
@@ -134,9 +137,11 @@ def run(args_: List[str], depends: List[str]) -> str:
                 f.write(out)
             os.utime(cache_path, (mtime, mtime))
             
-        print(' ✔️')
+        if args.verbose:
+            print(' ✔️')
     else:
-        print(' ✔️  (cached)')        
+        if args.verbose:
+            print(' ✔️  (cached)')        
     return out
 
 def fmt_path(p):
@@ -292,16 +297,15 @@ for archive in args.files:
             sym_name = line[:-3]
         elif 'discriminator' in line:
             src = line.split()[0]
-        elif 'R_X86_64_PLT32' in line:
+        elif 'R_X86_64_PLT32' in line or 'R_X86_64_PC32' in line:
             assert obj
             assert section
-            assert sym_name
+            if sym_name is None:
+                if args.trace:
+                    print('-> ignoring (sym name missing)')
+                continue
             parts = line.split()
             ref = parts[2]
-            # .text. is added for local (static) symbols
-            ref_sym = ref.replace('.text.', '')
-            suffix_idx = ref_sym.index('-0x')
-            ref_sym = ref_sym[:suffix_idx]
             sym = None
             if sym_name in defs_grouped[obj][section]:
                 sym = defs_grouped[obj][section][sym_name]
@@ -317,11 +321,28 @@ for archive in args.files:
                             for sym_ in syms.values():
                                 print(f'   {sym_.name}')
                 continue
-            assert sym
+            # .text. is added for local (static) symbols
+            ref_sym = ref.replace('.text.', '')
+            # .L., .rodata., ..-
+            starts_with_dot = ref_sym.startswith('.')
+            if 'R_X86_64_PC32' in line and starts_with_dot:
+                if args.trace:
+                    print('-> ignoring (starts with dot and is R_X86_64_PC32)')
+                continue
+            assert not starts_with_dot
+            try:
+                suffix_idx = ref_sym.index('-0x')
+            except ValueError:
+                if args.trace:
+                    print('-> ignoring (cannot parse referenced symbol name)')
+                continue
+            ref_sym = ref_sym[:suffix_idx]
             refs[ref_sym].append(SymbolReference(
                 referencing_sym=sym,
                 referenced_sym=ref_sym,
                 src=src))
+            if args.trace:
+                print(f'found reference: {sym_name} -> {ref_sym}')
         else:
             if args.trace:
                 print('-> ignoring')
@@ -339,8 +360,20 @@ if args.verbose:
     print('==== end symbols and direct references ====')
 
 class LinkReference(NamedTuple):
-    group: Union[Object, Section] # Section if --gc-sections, otherwise Object
+    # The section/object being pulled in during linking.
+    # Section if --gc-sections, otherwise Object.
+    group: Union[Object, Section] 
+
+    # All symbols in `group` that directly reference the previous symbol in the path.
     refs: FrozenSet[SymbolReference]
+    
+    # The symbol in `group` that directly or indirectly references the previous symbol in the path.
+    # A direct reference (SymbolReference, one of `refs`) is typically a function call to the previous symbol.
+    # An indirect reference (DefinedSymbol) is due to being in the same section/object as a direct reference.
+    # Indirect references typically occur when -ffunction-sections/--gc-sections is not used and
+    # multiple functions are part of the same source file. Calling/referencing a single function will
+    # pull in all other symbols of the same source file / object.
+    ref: Union[SymbolReference, DefinedSymbol]
 
 LinkReferencePath = Tuple[LinkReference,...]
 
@@ -348,107 +381,175 @@ if args.require_defined:
     require_defined: Set[SymbolName] = set(args.require_defined)
 
 def prune_link_ref_path(path: LinkReferencePath) -> LinkReferencePath:
-    if len(path) == 0 or args.whole_archive:
+    if len(path) == 0:
+        return path
+    elif args.whole_archive:
+        if args.direct_only and any(isinstance(r.ref, DefinedSymbol) for r in path):
+            return tuple()
         return path
     elif args.require_defined:
         found_required_at = -1
         for i, link_ref in enumerate(path[::-1]):
-            path_syms: AbstractSet[SymbolName]
-            if isinstance(link_ref.group, Section):
-                section = link_ref.group
-                path_syms = global_defs_grouped[section.obj][section].keys()
-            else: # Object
-                obj = link_ref.group
-                path_syms = set()
-                for section_syms in global_defs_grouped[obj].values():
-                    path_syms |= section_syms.keys()
-            if not require_defined.isdisjoint(path_syms):
-                found_required_at = len(path) - 1 - i
-                break
+            if isinstance(link_ref.ref, DefinedSymbol):
+                if args.direct_only:
+                    return tuple()
+                sym_name = link_ref.ref.name
+            else:
+                sym_name = link_ref.ref.referencing_sym.name
+            if found_required_at == -1:
+                if sym_name in require_defined:
+                    found_required_at = len(path) - 1 - i
+                    if not args.direct_only:
+                        break
         if found_required_at == -1:
             return tuple()
         else:
             return tuple(path[:found_required_at + 1])
+    
     assert False
 
-def walk_link_ref_paths(sym_name: str, path_fn: Callable[[LinkReferencePath], None],
-                        head_path: LinkReferencePath=()) -> None:
-    if args.verbose:
-        print(f'{sym_name}')
+def walk_link_ref_paths(sym_name: str, path_fn: Callable[[LinkReferencePath], bool],
+                        head_path: LinkReferencePath=()) -> bool:
+    if args.trace:
+        print(f'ref: {sym_name}')
     sym_refs = refs[sym_name]
     if not sym_refs:
         pruned_path = prune_link_ref_path(head_path)
         if pruned_path:
-            path_fn(pruned_path)
-        return
+            if args.verbose:
+                print('path found!')
+                if len(head_path) != len(pruned_path):
+                    print(f'original: {head_path}')
+                    print(f'pruned:   {pruned_path}')
+            return path_fn(pruned_path)
+        return True
     if args.gc_sections:
         def by_section_key(sym_ref: SymbolReference):
             return sym_ref.referencing_sym.section
         sym_refs = sorted(sym_refs, key=by_section_key) # groupby requires sorted iterable
         sym_refs_by_section = groupby(sym_refs, key=by_section_key)
         for section, sym_refs_ in sym_refs_by_section:
-            if section in set(link_ref.group for link_ref in head_path):
-                continue # cycle detected
-            link_ref = LinkReference(section, frozenset(sym_refs_))
-            if args.verbose:
+            if args.trace:
                 print(f' {section.name} {section.obj.name}')
-            for sym_name_ in defs_grouped[section.obj][section].keys():
-                if args.verbose:
-                    print(f'  {sym_name_}')
-                walk_link_ref_paths(sym_name_, path_fn, (*head_path, link_ref))
+            if section in set(link_ref.group for link_ref in head_path):
+                # TODO stopping at cycles leads to truncated paths which may be confusing
+                if args.trace:
+                    print('cycle detected, stopping here')
+                    link_path = ' -> '.join(link_ref.group.name for link_ref in head_path)
+                    print(link_path)
+                pruned_path = prune_link_ref_path(head_path)
+                if pruned_path:
+                    if args.verbose:
+                        print('path found! (stopped at cycle start)')
+                        if len(head_path) != len(pruned_path):
+                            print(f'original: {head_path}')
+                            print(f'pruned:   {pruned_path}')
+                    return path_fn(pruned_path)
+                return True
+            sym_refs_ = frozenset(sym_refs_)
+            for sym in defs_grouped[section.obj][section].values():
+                if args.trace:
+                    print(f'  {sym.name}')
+                ref = next((r for r in sym_refs_ if r.referencing_sym == sym), sym)
+                link_ref = LinkReference(section, sym_refs_, ref)
+                if not walk_link_ref_paths(sym.name, path_fn, (*head_path, link_ref)):
+                    if args.verbose:
+                        print('stopping search')
+                    return False
     else:
         def by_obj_key(sym_ref: SymbolReference):
             return sym_ref.referencing_sym.section.obj
         sym_refs = sorted(sym_refs, key=by_obj_key)
         sym_refs_by_obj = groupby(sym_refs, key=by_obj_key)
         for obj, sym_refs_ in sym_refs_by_obj:
+            if args.trace:
+                print(f'obj: {obj.name}')
             if obj in set(link_ref.group for link_ref in head_path):
-                continue # cycle detected
-            link_ref = LinkReference(obj, frozenset(sym_refs_))
-            if args.verbose:
-                print(f' {obj.name}')
-            for section_syms in defs_grouped[obj].values():
-                for sym_name_ in section_syms.keys():
+                # TODO stopping at cycles leads to truncated paths which may be confusing
+                if args.trace:
+                    print('cycle detected')
+                    if args.trace:
+                        link_path = ' -> '.join(link_ref.group.name for link_ref in head_path)
+                        print(link_path)
+                pruned_path = prune_link_ref_path(head_path)
+                if pruned_path:
                     if args.verbose:
-                        print(f'  {sym_name_}')
-                    walk_link_ref_paths(sym_name_, path_fn, (*head_path, link_ref))
+                        print('path found! (stopped at cycle start)')
+                        if len(head_path) != len(pruned_path):
+                            print(f'original: {head_path}')
+                            print(f'pruned:   {pruned_path}')
+                    return path_fn(pruned_path)
+                return True
+            sym_refs_ = frozenset(sym_refs_)
+            for section, section_syms in defs_grouped[obj].items():
+                if args.trace:
+                    print(f'section: {section.name}')
+                for sym in section_syms.values():
+                    if args.trace:
+                        print(f'{obj.name} {section.name} {sym.name}')
+                    ref = next((r for r in sym_refs_ if r.referencing_sym == sym), sym)
+                    link_ref = LinkReference(obj, sym_refs_, ref)
+                    if not walk_link_ref_paths(sym.name, path_fn, (*head_path, link_ref)):
+                        if args.verbose:
+                            print('stopping search')
+                        return False
+    return True
 
 def print_link_ref_path(path: LinkReferencePath):
     for i, link_ref in enumerate(path):
         if isinstance(link_ref.group, Object):
-            print(f'#{i+1} {link_ref.group.name} ({fmt_path(link_ref.group.archive)})')
-            path_syms = set()
-            for section_syms in global_defs_grouped[link_ref.group].values():
-                path_syms |= section_syms.keys()
+            print(f'#{len(path)-i-1}  {link_ref.group.name} ({fmt_path(link_ref.group.archive)})')
         else: # Section
-            print(f'#{i+1} {link_ref.group.name} ({link_ref.group.obj.name} {fmt_path(link_ref.group.obj.archive)})')
-            path_syms = global_defs_grouped[link_ref.group.obj][link_ref.group].keys()
-        global_ref_sym_names = set()
-        for sym_ref in sorted(link_ref.refs, key=lambda sym_ref: sym_ref.referencing_sym.name + sym_ref.src):
-            sym = sym_ref.referencing_sym
+            print(f'#{len(path)-i-1}  {link_ref.group.name} ({link_ref.group.obj.name} {fmt_path(link_ref.group.obj.archive)})')
+        
+        def get_prefix(sym: DefinedSymbol):
             if sym.is_global and args.require_defined and sym.name in require_defined:
-                prefix = '*'
-                global_ref_sym_names.add(sym.name)
+                return '!'
             else:
-                prefix = ' '            
-            print(f'  {prefix}{sym.name} {fmt_path(sym_ref.src)}')
-        if args.require_defined:
-            for require_defined_sym in sorted(require_defined & path_syms - global_ref_sym_names):
-                print(f'  *{require_defined_sym}')
+                return ' '
+
+        if isinstance(link_ref.ref, SymbolReference):
+            # Direct reference, print only that.
+            sym = link_ref.ref.referencing_sym
+            print(f'{get_prefix(sym)}^*   {sym.name} {fmt_path(link_ref.ref.src)}')
+        else:
+            # Indirect reference, print that and all direct references for context.
+            sym = link_ref.ref
+            print(f'{get_prefix(sym)}.*   {sym.name} {fmt_path(link_ref.ref.src)}')
+            for sym_ref in sorted(link_ref.refs, key=lambda sym_ref: sym_ref.referencing_sym.name + sym_ref.src):
+                sym = sym_ref.referencing_sym
+                print(f'{get_prefix(sym)}^    {sym.name} {fmt_path(sym_ref.src)}')
 
 print()
 for sym_name in args.trace_symbol:
-    # Paths can be duplicated if a symbol is referenced by another symbol
-    # from multiple locations in the same object. Report only once.
+    syms = global_defs[sym_name] or defs[sym_name]
+    if len(syms) == 0:
+        loc = '(undefined)'
+        src = ''
+    elif len(syms) == 1:
+        if args.gc_sections:
+            loc = f'{syms[0].section.name} ({syms[0].section.obj.name} {fmt_path(syms[0].section.obj.archive)})'
+        else:
+            loc = f'{syms[0].section.obj.name} ({fmt_path(syms[0].section.obj.archive)})'
+        src = syms[0].src
+    else:
+        loc = '(multiple defs)'
+        src = ''
     seen = set()
     def on_path_found(path: LinkReferencePath):
-        path_groups = tuple(p.group for p in path)
-        if path_groups in seen:
-            return
-        seen.add(path_groups)
-        print(f'#0 {sym_name}')
+        # Pruning can produce duplicate paths, only print once.
+        if path in seen:
+            return True
+        seen.add(path)
+        global found
+        found = True
+        print(f'#{len(path)}  {loc}')
+        print(f'  *   {sym_name} {fmt_path(src)}')
         print_link_ref_path(path)
         print()
+        if args.first_only:
+            return False # stop
+        return True # keep going
     walk_link_ref_paths(sym_name, on_path_found)
     if not seen:
         print(f'No paths found for {sym_name}.')
