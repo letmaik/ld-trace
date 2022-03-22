@@ -178,7 +178,7 @@ for namespec in args.libraries:
 
 for archive in args.files:
     # nm does not provide section names, objdump does not provide source/line info, use both.
-    nm_out = run(['nm', '--defined-only', '--line-numbers', archive], depends=[archive])
+    nm_out = run(['nm', '-A', '--defined-only', '--line-numbers', archive], depends=[archive])
     objdump_out = run(['objdump', '--syms', archive], depends=[archive])
 
     # parse objdump output to create symbol -> section mapping
@@ -221,36 +221,38 @@ for archive in args.files:
             continue
         if args.trace:
             print(f'LINE: {line}')
-        parts = line.split()
-        if len(parts) == 1:
-            # object start
-            # a.o:
-            obj = Object(parts[0][:-1], archive)
+        # libqcbor.enclave.a:ieee754.c.o:0000000000000000 T IEEE754_DoubleToSmallestInternal
+        [location, rest] = line.split(maxsplit=1)
+        parts = location.split(':')
+        if len(parts) == 3:
+            [_, object_name, address] = parts
+        elif len(parts) == 2:
+            [object_name, address] = parts
         else:
-            # symbol
-            # 0000000000000000 T a1	/.../linker-tests/a.c:1
-            assert obj
-            typ = parts[1]
-            sym_name = parts[2]
-            src = parts[3] if len(parts) == 4 else '?'
-            is_global = parts[1] in ['T', 'W']
-            if typ not in ['T', 'W', 't']:
-                if args.verbose:
-                    print(f'NOTE: ignoring {typ} definition of {sym_name} ({fmt_path(obj.archive)})')
-                continue
-            if typ == 't' and '.text.' in sym_name:
-                if args.verbose:
-                    print(f'NOTE: ignoring {typ} definition of {sym_name} ({fmt_path(obj.archive)})')
-                continue
-            section_name = sym_section_map[obj][sym_name]
-            section = Section(section_name, obj)
-            assert section
-            def_symbol = DefinedSymbol(sym_name, typ, is_global, src, section)
-            defs[sym_name].append(def_symbol)
-            defs_grouped[obj][section][sym_name] = def_symbol
-            if is_global:
-                global_defs[sym_name].append(def_symbol)
-                global_defs_grouped[obj][section][sym_name] = def_symbol  
+            assert False, line
+        obj = Object(object_name, archive)
+        parts = rest.split()  
+        typ = parts[0]
+        sym_name = parts[1]
+        src = parts[2] if len(parts) == 4 else '?'
+        is_global = parts[0] in ['T', 'W']
+        if typ not in ['T', 'W', 't']:
+            if args.verbose:
+                print(f'NOTE: ignoring {typ} definition of {sym_name} ({fmt_path(obj.archive)})')
+            continue
+        if typ == 't' and '.text.' in sym_name:
+            if args.verbose:
+                print(f'NOTE: ignoring {typ} definition of {sym_name} ({fmt_path(obj.archive)})')
+            continue
+        section_name = sym_section_map[obj][sym_name]
+        section = Section(section_name, obj)
+        assert section
+        def_symbol = DefinedSymbol(sym_name, typ, is_global, src, section)
+        defs[sym_name].append(def_symbol)
+        defs_grouped[obj][section][sym_name] = def_symbol
+        if is_global:
+            global_defs[sym_name].append(def_symbol)
+            global_defs_grouped[obj][section][sym_name] = def_symbol  
 
 for name, syms in global_defs.items():
     if sum(sym.type == 'T' for sym in syms) <= 1:
